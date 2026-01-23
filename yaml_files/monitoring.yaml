@@ -1,0 +1,263 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: Centralized CloudWatch alarm aggregation and monitoring dashboard
+
+Parameters:
+  LambdaStackName:
+    Type: String
+    Default: lambda-stack
+    Description: Name of the Lambda stack
+
+  ApiGatewayStackName:
+    Type: String
+    Default: apigw-stack
+    Description: Name of the API Gateway stack
+
+  CloudFrontStackName:
+    Type: String
+    Default: cloudfront-stack
+    Description: Name of the CloudFront stack
+
+  EnableSnsNotifications:
+    Type: String
+    Default: 'false'
+    AllowedValues: ['true','false']
+    Description: Enable SNS notifications for alarm state changes
+
+  SnsEmailAddress:
+    Type: String
+    Default: ''
+    Description: Email address to subscribe to alarm notifications (required if EnableSnsNotifications is true)
+
+Conditions:
+  SnsEnabled: !Equals [!Ref EnableSnsNotifications, 'true']
+  SnsEmailProvided: !Not [!Equals [!Ref SnsEmailAddress, '']]
+  SnsEnabledWithEmail: !And
+    - !Equals [!Ref EnableSnsNotifications, 'true']
+    - !Not [!Equals [!Ref SnsEmailAddress, '']]
+
+Resources:
+  # SNS Topic for alarm notifications (optional)
+  AlarmNotificationTopic:
+    Type: AWS::SNS::Topic
+    Condition: SnsEnabled
+    Properties:
+      TopicName: !Sub 'secure-architecture-alarms-${AWS::StackName}'
+      DisplayName: Secure Architecture Alarm Notifications
+      Tags:
+        - Key: Purpose
+          Value: Alarm-Aggregation
+
+  AlarmNotificationSubscription:
+    Type: AWS::SNS::Subscription
+    Condition: SnsEnabledWithEmail
+    Properties:
+      TopicArn: !Ref AlarmNotificationTopic
+      Protocol: email
+      Endpoint: !Ref SnsEmailAddress
+
+  # Composite Alarm - Critical infrastracture health
+  CriticalInfrastructureAlarm:
+    Type: AWS::CloudWatch::CompositeAlarm
+    Properties:
+      AlarmName: critical-infrastructure-health
+      AlarmDescription: Composite alarm monitoring critical Lambda, API Gateway, and CloudFront health
+      ActionsEnabled: true
+      AlarmActions: !If [SnsEnabled, [!Ref AlarmNotificationTopic], !Ref 'AWS::NoValue']
+      AlarmRule: !Sub "(ALARM(${LambdaErrorAlarmArn}) OR ALARM(${LambdaThrottleAlarmArn}) OR ALARM(${ApiErrorAlarmArn}) OR ALARM(${CloudFront5xxAlarmArn}))"
+
+  # Dashboard - unified monitoring view
+  MonitoringDashboard:
+    Type: AWS::CloudWatch::Dashboard
+    Properties:
+      DashboardName: secure-architecture-monitoring
+      DashboardBody: !Sub |
+        {
+          "widgets": [
+            {
+              "type": "metric",
+              "properties": {
+                "metrics": [
+                  ["AWS/Lambda", "Errors", {"stat": "Sum"}],
+                  [".", "Throttles", {"stat": "Sum"}],
+                  [".", "Duration", {"stat": "Average"}],
+                  [".", "ConcurrentExecutions", {"stat": "Maximum"}]
+                ],
+                "period": 300,
+                "stat": "Average",
+                "region": "${AWS::Region}",
+                "title": "Lambda Function Metrics",
+                "yAxis": {"left": {"min": 0}}
+              }
+            },
+            {
+              "type": "metric",
+              "properties": {
+                "metrics": [
+                  ["AWS/ApiGateway", "4XXError", {"stat": "Sum"}],
+                  [".", "5XXError", {"stat": "Sum"}],
+                  [".", "Latency", {"stat": "Average"}],
+                  [".", "Count", {"stat": "Sum"}]
+                ],
+                "period": 300,
+                "stat": "Average",
+                "region": "${AWS::Region}",
+                "title": "API Gateway Metrics"
+              }
+            },
+            {
+              "type": "metric",
+              "properties": {
+                "metrics": [
+                  ["AWS/CloudFront", "4xxErrorRate", {"stat": "Average"}],
+                  [".", "5xxErrorRate", {"stat": "Average"}],
+                  [".", "BytesDownloaded", {"stat": "Sum"}],
+                  [".", "Requests", {"stat": "Sum"}]
+                ],
+                "period": 300,
+                "stat": "Average",
+                "region": "us-east-1",
+                "title": "CloudFront Distribution Metrics"
+              }
+            },
+            {
+              "type": "log",
+              "properties": {
+                "query": "fields @timestamp, @message | filter @message like /ERROR/ | stats count() as error_count by @logStream",
+                "region": "${AWS::Region}",
+                "title": "Error Log Analysis (Last Hour)"
+              }
+            }
+          ]
+        }
+
+  # Metric Alarm - Lambda errors
+  LambdaErrorAlarmArn:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: aggregated-lambda-errors
+      AlarmDescription: Lambda function errors detected (aggregated monitoring)
+      Namespace: AWS/Lambda
+      MetricName: Errors
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 5
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: !If [SnsEnabled, [!Ref AlarmNotificationTopic], !Ref 'AWS::NoValue']
+
+  # Metric Alarm - Lambda throttles
+  LambdaThrottleAlarmArn:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: aggregated-lambda-throttles
+      AlarmDescription: Lambda function throttling detected
+      Namespace: AWS/Lambda
+      MetricName: Throttles
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: !If [SnsEnabled, [!Ref AlarmNotificationTopic], !Ref 'AWS::NoValue']
+
+  # Metric Alarm - API Gateway errors
+  ApiErrorAlarmArn:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: aggregated-api-gateway-errors
+      AlarmDescription: API Gateway returning 4xx/5xx errors
+      Namespace: AWS/ApiGateway
+      MetricName: 4XXError
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 10
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: !If [SnsEnabled, [!Ref AlarmNotificationTopic], !Ref 'AWS::NoValue']
+
+  # Metric Alarm - CloudFront 5xx errors
+  CloudFront5xxAlarmArn:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: aggregated-cloudfront-5xx
+      AlarmDescription: CloudFront 5xx error rate exceeds threshold
+      Namespace: AWS/CloudFront
+      MetricName: 5xxErrorRate
+      Statistic: Average
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: !If [SnsEnabled, [!Ref AlarmNotificationTopic], !Ref 'AWS::NoValue']
+
+  # Alarm State Change Event Rule (for automation/automation)
+  AlarmStateChangeRule:
+    Type: AWS::Events::Rule
+    Condition: SnsEnabled
+    Properties:
+      Description: Capture all CloudWatch alarm state changes
+      EventPattern:
+        source:
+          - aws.cloudwatch
+        detail-type:
+          - CloudWatch Alarm State Change
+      State: ENABLED
+      Targets:
+        - Arn: !Ref AlarmNotificationTopic
+          RoleArn: !GetAtt EventsRole.Arn
+
+  EventsRole:
+    Type: AWS::IAM::Role
+    Condition: SnsEnabled
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: events.amazonaws.com
+            Action: 'sts:AssumeRole'
+      Policies:
+        - PolicyName: PublishToSnsTopic
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - 'sns:Publish'
+                Resource: !Ref AlarmNotificationTopic
+
+Outputs:
+  MonitoringDashboardUrl:
+    Description: URL to CloudWatch monitoring dashboard
+    Value: !Sub 'https://console.aws.amazon.com/cloudwatch/home?region=${AWS::Region}#dashboards:name=secure-architecture-monitoring'
+    Export:
+      Name: !Sub ${AWS::StackName}-DashboardUrl
+
+  AlarmNotificationTopicArn:
+    Description: SNS topic ARN for alarm notifications
+    Condition: SnsEnabled
+    Value: !Ref AlarmNotificationTopic
+    Export:
+      Name: !Sub ${AWS::StackName}-AlarmTopicArn
+
+  CriticalAlarmArn:
+    Description: Composite alarm for critical infrastructure health
+    Value: !GetAtt CriticalInfrastructureAlarm.Arn
+    Export:
+      Name: !Sub ${AWS::StackName}-CriticalAlarmArn
+
+  MonitoringSetup:
+    Description: Centralized monitoring configuration
+    Value: |
+      ✓ CloudWatch Dashboard: unified metric view
+      ✓ Composite Alarm: critical infrastructure health
+      ✓ SNS notifications: optional (via parameter)
+      ✓ EventBridge rule: alarm state change automation
+      ✓ Supported metrics: Lambda, API Gateway, CloudFront
+    Export:
+      Name: !Sub ${AWS::StackName}-MonitoringSetup

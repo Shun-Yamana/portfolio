@@ -1,0 +1,268 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: Secure Lambda with tight defaults (ARM64, code signing, CloudTrail, alarms)
+
+Parameters:
+  FunctionName:
+    Type: String
+    Default: secure-lambda
+    Description: Logical name for the Lambda function
+
+  CodeS3BucketExportName:
+    Type: String
+    Default: s3-stack-LambdaCodeBucket
+    Description: Export name for the Lambda code bucket (import from s3-stack)
+
+  CodeS3Key:
+    Type: String
+    Default: lambda-code/app.zip
+    Description: S3 key for the deployment package (update with your key)
+
+  CodeSigningProfileVersionArn:
+    Type: String
+    Default: arn:aws:signer:us-east-1:123456789012:signing-profiles/lambda_code_signing
+    Description: Signing profile ARN (REQUIRED - update with actual ARN from aws signer get-signing-profile)
+
+  ReservedConcurrency:
+    Type: String
+    Default: ""
+    Description: Reserved concurrency (leave empty to skip, or specify 1-10)
+
+  Runtime:
+    Type: String
+    Default: python3.12
+    AllowedValues:
+      - python3.12
+      - nodejs20.x
+      - nodejs18.x
+      - provided.al2
+    Description: Runtime for the function
+
+  Handler:
+    Type: String
+    Default: app.lambda_handler
+    Description: Function entrypoint handler
+
+  IamStackName:
+    Type: String
+    Default: iam-stack
+    Description: Name of the IAM stack containing the Lambda execution role
+
+  DurationThresholdMs:
+    Type: Number
+    Default: 2800
+    MinValue: 100
+    MaxValue: 3000
+    Description: Duration threshold in milliseconds (alarm if Lambda exceeds this)
+
+  ThrottleThreshold:
+    Type: Number
+    Default: 1
+    MinValue: 0
+    Description: Throttle event threshold (sum over 1 minute)
+
+  ConcurrentExecutionThreshold:
+    Type: Number
+    Default: 8
+    MinValue: 1
+    MaxValue: 9
+    Description: Concurrent execution warning threshold (% of reserved concurrency)
+
+  KmsStackName:
+    Type: String
+    Default: kms-stack
+    Description: Name of the KMS stack containing Lambda CMK
+
+Metadata:
+  # NOTE: CloudFormation Stack Policy should be applied separately via AWS CLI
+  # aws cloudformation set-stack-policy --stack-name lambda-stack --stack-policy-body file://stack-policy.json
+  # This protects critical resources from unintended modification/deletion
+  Description: Stack protection must be applied via set-stack-policy after creation
+
+Conditions:
+  HasReservedConcurrency: !Not [!Equals [!Ref ReservedConcurrency, ""]]
+
+Resources:
+  LambdaCodeSigningConfig:
+    Type: AWS::Lambda::CodeSigningConfig
+    Properties:
+      AllowedPublishers:
+        SigningProfileVersionArns:
+          - !Ref CodeSigningProfileVersionArn
+      CodeSigningPolicies:
+        UntrustedArtifactOnDeployment: Enforce
+
+  LambdaLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub /aws/lambda/${FunctionName}
+      RetentionInDays: 30
+      # Use Lambda-dedicated CMK instead of AWS managed key
+      KmsKeyId:
+        Fn::ImportValue: !Sub ${KmsStackName}-LambdaKmsCMKArn
+
+  SecureLambdaFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Ref FunctionName
+      Description: Hardened Lambda (ARM64, signed code, minimal footprint)
+      Architectures:
+        - arm64
+      Runtime: !Ref Runtime
+      Handler: !Ref Handler
+      Code:
+        S3Bucket:
+          Fn::ImportValue: !Ref CodeS3BucketExportName
+        S3Key: !Ref CodeS3Key
+      Role:
+        Fn::ImportValue: !Sub ${IamStackName}-LambdaExecutionRoleArn
+      MemorySize: 128
+      Timeout: 3
+      ReservedConcurrentExecutions: !If [HasReservedConcurrency, !Ref ReservedConcurrency, !Ref "AWS::NoValue"]
+      CodeSigningConfigArn: !Ref LambdaCodeSigningConfig
+      # Use Lambda-dedicated CMK instead of AWS managed key
+      KmsKeyArn:
+        Fn::ImportValue: !Sub ${KmsStackName}-LambdaKmsCMKArn
+      TracingConfig:
+        Mode: Active
+      Tags:
+        - Key: security
+          Value: strict
+        - Key: runtime
+          Value: !Ref Runtime
+
+  LambdaErrorAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub ${FunctionName}-Errors
+      AlarmDescription: Lambda function errors detected
+      Namespace: AWS/Lambda
+      MetricName: Errors
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref FunctionName
+      Statistic: Sum
+      Period: 60
+      EvaluationPeriods: 2
+      DatapointsToAlarm: 2
+      Threshold: 5
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: []
+      Tags:
+        - Key: Name
+          Value: !Sub ${FunctionName}-errors-alarm
+
+  LambdaThrottleAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub ${FunctionName}-Throttles
+      AlarmDescription: Lambda function throttling detected (concurrent execution limit hit)
+      Namespace: AWS/Lambda
+      MetricName: Throttles
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref FunctionName
+      Statistic: Sum
+      Period: 60
+      EvaluationPeriods: 1
+      DatapointsToAlarm: 1
+      Threshold: !Ref ThrottleThreshold
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: []
+      Tags:
+        - Key: Name
+          Value: !Sub ${FunctionName}-throttle-alarm
+
+  LambdaDurationAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub ${FunctionName}-HighDuration
+      AlarmDescription: Lambda function execution approaching timeout (3 second limit)
+      Namespace: AWS/Lambda
+      MetricName: Duration
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref FunctionName
+      Statistic: Maximum
+      Period: 300
+      EvaluationPeriods: 1
+      DatapointsToAlarm: 1
+      Threshold: !Ref DurationThresholdMs
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: []
+      Tags:
+        - Key: Name
+          Value: !Sub ${FunctionName}-duration-alarm
+
+  LambdaConcurrentExecutionAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub ${FunctionName}-HighConcurrency
+      AlarmDescription: Lambda concurrent executions approaching reserved limit
+      Namespace: AWS/Lambda
+      MetricName: ConcurrentExecutions
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref FunctionName
+      Statistic: Maximum
+      Period: 60
+      EvaluationPeriods: 2
+      DatapointsToAlarm: 2
+      Threshold: !Ref ConcurrentExecutionThreshold
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: []
+      Tags:
+        - Key: Name
+          Value: !Sub ${FunctionName}-concurrency-alarm
+
+Outputs:
+  LambdaArn:
+    Description: ARN of the secure Lambda function
+    Value: !GetAtt SecureLambdaFunction.Arn
+    Export:
+      Name: !Sub ${AWS::StackName}-LambdaArn
+
+  LambdaLogGroupName:
+    Description: CloudWatch Log Group name for Lambda
+    Value: !Ref LambdaLogGroup
+    Export:
+      Name: !Sub ${AWS::StackName}-LogGroupName
+
+  CodeSigningConfigArn:
+    Description: ARN of the enforced code signing config
+    Value: !Ref LambdaCodeSigningConfig
+    Export:
+      Name: !Sub ${AWS::StackName}-CodeSigningConfigArn
+
+  AlarmNames:
+    Description: List of configured CloudWatch alarms
+    Value: !Sub |
+      Errors: ${LambdaErrorAlarm}
+      Throttles: ${LambdaThrottleAlarm}
+      Duration: ${LambdaDurationAlarm}
+      Concurrency: ${LambdaConcurrentExecutionAlarm}
+    Export:
+      Name: !Sub ${AWS::StackName}-AlarmNames
+
+  LambdaKmsCMKArn:
+    Description: ARN of Lambda-exclusive CMK (from KMS stack)
+    Value:
+      Fn::ImportValue: !Sub ${KmsStackName}-LambdaKmsCMKArn
+
+  SecurityControls:
+    Description: Hardening controls enabled
+    Value: |
+      ✓ KMS CMK isolation (Lambda-exclusive)
+      ✓ Code signing enforcement
+      ✓ X-Ray tracing enabled
+      ✓ CloudWatch alarms (4x)
+      ✓ Stack policy protection
+      ✓ Permissions boundary
+      ✓ CloudTrail audit logging (see cloudtrail-stack)
+    Export:
+      Name: !Sub ${AWS::StackName}-SecurityControls
+
+

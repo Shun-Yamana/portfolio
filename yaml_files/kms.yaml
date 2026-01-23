@@ -1,0 +1,102 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: KMS CMK for Lambda encryption - isolated key for environment variables and logs
+
+Parameters:
+  FunctionName:
+    Type: String
+    Default: secure-lambda
+    Description: Lambda function name (for key alias)
+  
+  IamStackName:
+    Type: String
+    Default: iam-stack
+    Description: Name of the IAM stack containing the Lambda execution role ARN
+
+Resources:
+  LambdaKmsCMK:
+    Type: AWS::KMS::Key
+    Properties:
+      Description: Lambda-exclusive CMK for environment variables, logs, and data encryption
+      EnableKeyRotation: true
+      KeyPolicy:
+        Version: '2012-10-17'
+        Statement:
+          # Root account (disaster recovery only)
+          - Sid: Enable IAM policies
+            Effect: Allow
+            Principal:
+              AWS: !Sub arn:${AWS::Partition}:iam::${AWS::AccountId}:root
+            Action: 'kms:*'
+            Resource: '*'
+          
+          # Lambda execution role - Decrypt only (for env vars, logs)
+          - Sid: Allow Lambda execution role to decrypt
+            Effect: Allow
+            Principal:
+              AWS:
+                Fn::ImportValue: !Sub ${IamStackName}-LambdaExecutionRoleArn
+            Action:
+              - 'kms:Decrypt'
+              - 'kms:DescribeKey'
+              - 'kms:GenerateDataKey'
+            Resource: '*'
+            Condition:
+              StringEquals:
+                'kms:ViaService':
+                  - !Sub 'lambda.${AWS::Region}.amazonaws.com'
+                  - !Sub 'logs.${AWS::Region}.amazonaws.com'
+          
+          # CloudWatch Logs service - Encrypt logs
+          - Sid: Allow CloudWatch Logs
+            Effect: Allow
+            Principal:
+              Service: !Sub 'logs.${AWS::Region}.amazonaws.com'
+            Action:
+              - 'kms:Encrypt'
+              - 'kms:Decrypt'
+              - 'kms:ReEncrypt*'
+              - 'kms:GenerateDataKey*'
+              - 'kms:CreateGrant'
+              - 'kms:DescribeKey'
+            Resource: '*'
+            Condition:
+              ArnLike:
+                'kms:EncryptionContext:aws:logs:arn': !Sub 'arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:*'
+          
+          # CloudTrail (for audit logs if needed)
+          - Sid: Allow CloudTrail to encrypt audit logs
+            Effect: Allow
+            Principal:
+              Service: cloudtrail.amazonaws.com
+            Action:
+              - 'kms:GenerateDataKey'
+              - 'kms:DecryptDataKey'
+            Resource: '*'
+            Condition:
+              StringLike:
+                'kms:EncryptionContext:aws:cloudtrail:arn': !Sub 'arn:${AWS::Partition}:cloudtrail:*:${AWS::AccountId}:trail/*'
+
+  LambdaKmsCMKAlias:
+    Type: AWS::KMS::Alias
+    Properties:
+      AliasName: !Sub 'alias/${FunctionName}-cmk'
+      TargetKeyId: !Ref LambdaKmsCMK
+
+Outputs:
+  LambdaKmsCMKArn:
+    Description: ARN of Lambda-exclusive CMK
+    Value: !GetAtt LambdaKmsCMK.Arn
+    Export:
+      Name: !Sub ${AWS::StackName}-LambdaKmsCMKArn
+
+  LambdaKmsCMKId:
+    Description: Key ID of Lambda-exclusive CMK
+    Value: !Ref LambdaKmsCMK
+    Export:
+      Name: !Sub ${AWS::StackName}-LambdaKmsCMKId
+
+  LambdaKmsCMKAlias:
+    Description: Alias of Lambda-exclusive CMK
+    Value: !Ref LambdaKmsCMKAlias
+    Export:
+      Name: !Sub ${AWS::StackName}-LambdaKmsCMKAlias

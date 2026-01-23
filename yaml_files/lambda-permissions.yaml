@@ -1,0 +1,39 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: Lambda API Gateway invoke permissions (deploy after lambda-stack and apigw-stack)
+
+Parameters:
+  LambdaStackName:
+    Type: String
+    Default: lambda-stack
+    Description: Name of the Lambda stack
+
+  ApiGatewayStackName:
+    Type: String
+    Default: apigw-stack
+    Description: Name of the API Gateway stack
+
+  StageName:
+    Type: String
+    Default: v1
+    Description: API Gateway stage name
+
+Resources:
+  LambdaApiGatewayInvokePermissionCatchAll:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName:
+        Fn::ImportValue: !Sub ${LambdaStackName}-LambdaArn
+      Action: 'lambda:InvokeFunction'
+      Principal: apigateway.amazonaws.com
+      SourceArn:
+        Fn::Sub:
+          - arn:${AWS::Partition}:execute-api:${AWS::Region}:${AWS::AccountId}:${ApiId}/*
+          - ApiId:
+              Fn::ImportValue: !Sub ${ApiGatewayStackName}-ApiId
+
+Outputs:
+  CatchAllPermissionId:
+    Description: Lambda permission ID for all API Gateway routes
+    Value: !Ref LambdaApiGatewayInvokePermissionCatchAll
+    Export:
+      Name: !Sub ${AWS::StackName}-CatchAllPermissionId

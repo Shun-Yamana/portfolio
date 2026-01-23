@@ -1,0 +1,144 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: AWS Config setup for compliance monitoring (CloudFront HTTPS enforcement, Config rules)
+
+Parameters:
+  CloudFrontStackName:
+    Type: String
+    Default: cloudfront-stack
+    Description: Name of the CloudFront stack
+
+Resources:
+  ConfigRecorderRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: config.amazonaws.com
+            Action: 'sts:AssumeRole'
+      Policies:
+        - PolicyName: ConfigRecorderPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - 's3:GetBucketVersioning'
+                  - 's3:PutObject'
+                  - 's3:GetObject'
+                  - 's3:GetBucket*'
+                  - 's3:ListAllMyBuckets'
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - 'sns:Publish'
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - 'logs:CreateLogGroup'
+                  - 'logs:CreateLogStream'
+                  - 'logs:PutLogEvents'
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - 'config:Put*'
+                  - 'cloudtrail:DescribeTrails'
+                  - 'cloudtrail:GetTrailStatus'
+                  - 'cloudtrail:LookupEvents'
+                  - 'ec2:Describe*'
+                  - 'cloudfront:GetDistribution*'
+                  - 'cloudfront:ListDistributions'
+                  - 'lambda:GetFunction*'
+                  - 'lambda:ListFunctions'
+                  - 'iam:GetRole*'
+                  - 'iam:ListRoles'
+                Resource: '*'
+      Tags:
+        - Key: Purpose
+          Value: Config-Recorder
+
+  # AWS Config Recorder - captures configuration changes
+  ConfigRecorder:
+    Type: AWS::Config::ConfigurationRecorder
+    DependsOn: ConfigRecorderRole
+    Properties:
+      RoleArn: !GetAtt ConfigRecorderRole.Arn
+      RecordingGroup:
+        AllSupported: true
+        IncludeGlobalResources: true
+
+  # Delivery Channel - S3 bucket for Config snapshots
+  ConfigDeliveryChannel:
+    Type: AWS::Config::DeliveryChannel
+    Properties:
+      Name: config-delivery-channel
+      S3BucketName: !Ref ConfigSnapshotBucket
+      ConfigSnapshotDeliveryProperties:
+        DeliveryFrequency: Six_Hours
+
+  # S3 bucket for Config snapshots
+  ConfigSnapshotBucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Retain
+    Properties:
+      BucketName: !Sub 'config-snapshots-${AWS::AccountId}-${AWS::Region}'
+      VersioningConfiguration:
+        Status: Enabled
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+
+  # Bucket policy to allow AWS Config writes
+  ConfigSnapshotBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref ConfigSnapshotBucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: AllowConfigWriteAccess
+            Effect: Allow
+            Principal:
+              Service: config.amazonaws.com
+            Action: 's3:PutObject'
+            Resource: !Sub '${ConfigSnapshotBucket.Arn}/*'
+            Condition:
+              StringEquals:
+                's3:x-amz-acl': bucket-owner-full-control
+          - Sid: AllowConfigAclCheck
+            Effect: Allow
+            Principal:
+              Service: config.amazonaws.com
+            Action: 's3:GetBucketAcl'
+            Resource: !GetAtt ConfigSnapshotBucket.Arn
+
+  # SNS Topic for Config notifications
+  ConfigNotificationTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: config-notifications
+      DisplayName: AWS Config Compliance Notifications
+      Tags:
+        - Key: Purpose
+          Value: Config-Notifications
+
+Outputs:
+  ConfigRecorderName:
+    Description: AWS Config Recorder name
+    Value: !Ref ConfigRecorder
+    Export:
+      Name: !Sub ${AWS::StackName}-RecorderName
+
+  ConfigRecorderRoleArn:
+    Description: Config Recorder IAM role ARN
+    Value: !GetAtt ConfigRecorderRole.Arn
+    Export:
+      Name: !Sub ${AWS::StackName}-RecorderRoleArn

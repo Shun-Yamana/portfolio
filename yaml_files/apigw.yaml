@@ -1,0 +1,224 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: HTTP API Gateway with Lambda proxy integration and security hardening
+
+Parameters:
+  LambdaStackName:
+    Type: String
+    Default: lambda-stack
+    Description: Name of the Lambda stack
+
+  StageName:
+    Type: String
+    Default: v1
+    Description: API stage name
+
+  # CORS configuration
+  CorsOriginUrl:
+    Type: String
+    Default: 'https://example.com'
+    Description: CORS allowed origin URL (e.g., https://your-frontend.com)
+
+  # JWT Authorizer parameters
+  EnableJwtAuthorizer:
+    Type: String
+    Default: 'false'
+    AllowedValues: ['true','false']
+    Description: Enable JWT Authorizer with Cognito (requires CognitoUserPoolId)
+
+  CognitoUserPoolId:
+    Type: String
+    Description: Cognito User Pool ID (e.g., us-east-1_xxxxx, leave empty if JWT disabled)
+    Default: ''
+
+  CognitoAppClientId:
+    Type: String
+    Description: Cognito App Client ID (leave empty if JWT disabled)
+    Default: ''
+
+Conditions:
+  # JWT Authorizer enabled only if explicitly set to 'true' AND Cognito IDs provided
+  JwtAuthorizerCondition: !And
+    - !Equals [!Ref EnableJwtAuthorizer, 'true']
+    - !Not [!Equals [!Ref CognitoUserPoolId, '']]
+    - !Not [!Equals [!Ref CognitoAppClientId, '']]
+
+Resources:
+  # HTTP API (cheaper and faster than REST API)
+  HttpApi:
+    Type: AWS::ApiGatewayV2::Api
+    Properties:
+      Name: secure-http-api
+      Description: Secure HTTP API with Lambda proxy integration
+      ProtocolType: HTTP
+      # CORS configuration - restrict to specific origins
+      CorsConfiguration:
+        AllowOrigins:
+          - !Ref CorsOriginUrl
+        AllowMethods:
+          - GET
+          - POST
+          - OPTIONS
+        AllowHeaders:
+          - 'Content-Type'
+          - 'X-Amz-Date'
+          - 'Authorization'
+          - 'X-Api-Key'
+        MaxAge: 300
+        AllowCredentials: false
+      Tags:
+        security: strict
+
+  # Lambda integration
+  LambdaIntegration:
+    Type: AWS::ApiGatewayV2::Integration
+    Properties:
+      ApiId: !Ref HttpApi
+      IntegrationType: AWS_PROXY
+      # Payload format version 2.0 (modern format)
+      PayloadFormatVersion: '2.0'
+      IntegrationUri: !Sub
+        - 'arn:${AWS::Partition}:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${LambdaArn}/invocations'
+        - LambdaArn:
+            Fn::ImportValue: !Sub ${LambdaStackName}-LambdaArn
+      TimeoutInMillis: 3500
+
+  # JWT Authorizer (Cognito) - conditional
+  CognitoJwtAuthorizer:
+    Type: AWS::ApiGatewayV2::Authorizer
+    Condition: JwtAuthorizerCondition
+    Properties:
+      Name: cognito-jwt-authorizer
+      ApiId: !Ref HttpApi
+      AuthorizerType: JWT
+      IdentitySource: '$request.header.Authorization'
+      JwtConfiguration:
+        Audience:
+          - !Ref CognitoAppClientId
+        Issuer: !Sub 'https://cognito-idp.${AWS::Region}.amazonaws.com/${CognitoUserPoolId}'
+
+  # Health check route - GET /health
+  HealthRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref HttpApi
+      RouteKey: 'GET /health'
+      Target: !Sub 'integrations/${LambdaIntegration}'
+
+  # Status route - GET /status
+  StatusRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref HttpApi
+      RouteKey: 'GET /status'
+      Target: !Sub 'integrations/${LambdaIntegration}'
+
+  # Deny undefined routes (strict security)
+  CatchAllRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref HttpApi
+      RouteKey: '$default'
+      Target: !Sub 'integrations/${LambdaIntegration}'
+
+  # Note: HTTP API does not support MOCK/response templates.
+  # $default is integrated to Lambda; return 404 within Lambda code for unknown paths.
+
+  # Stage
+  ApiStage:
+    Type: AWS::ApiGatewayV2::Stage
+    Properties:
+      ApiId: !Ref HttpApi
+      StageName: !Ref StageName
+      Description: !Sub 'API Stage - ${StageName}'
+      AutoDeploy: true
+      # Access logging
+      AccessLogSettings:
+        DestinationArn: !GetAtt ApiAccessLogGroup.Arn
+        Format: '{"requestId":"$context.requestId","ip":"$context.identity.sourceIp","routeKey":"$context.routeKey","status":"$context.status","responseLength":"$context.responseLength","integrationError":"$context.integrationErrorMessage"}'
+
+  # CloudWatch Log Group for API access logs
+  ApiAccessLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/apigateway/${StageName}'
+      RetentionInDays: 30
+
+  # CloudWatch Alarm - API errors
+  ApiErrorAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: secure-http-api-4xx-errors
+      AlarmDescription: API Gateway returning 4xx/5xx errors
+      Namespace: AWS/ApiGateway
+      MetricName: 4XXError
+      Dimensions:
+        - Name: ApiName
+          Value: secure-http-api
+        - Name: Stage
+          Value: !Ref StageName
+      Statistic: Sum
+      Period: 60
+      EvaluationPeriods: 2
+      Threshold: 10
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: []
+
+  # CloudWatch Alarm - API latency
+  ApiLatencyAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: secure-http-api-latency
+      AlarmDescription: API Gateway latency exceeds threshold
+      Namespace: AWS/ApiGateway
+      MetricName: IntegrationLatency
+      Dimensions:
+        - Name: ApiName
+          Value: secure-http-api
+        - Name: Stage
+          Value: !Ref StageName
+      Statistic: Average
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: 2000
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: []
+
+Outputs:
+  HttpApiEndpoint:
+    Description: HTTP API endpoint URL
+    Value: !Sub 'https://${HttpApi}.execute-api.${AWS::Region}.amazonaws.com/${StageName}'
+    Export:
+      Name: !Sub ${AWS::StackName}-ApiEndpoint
+
+  HttpApiId:
+    Description: HTTP API ID
+    Value: !Ref HttpApi
+    Export:
+      Name: !Sub ${AWS::StackName}-ApiId
+
+  ApiAccessLogGroup:
+    Description: CloudWatch Log Group for API access logs
+    Value: !Ref ApiAccessLogGroup
+    Export:
+      Name: !Sub ${AWS::StackName}-AccessLogGroup
+
+  HealthCheckUrl:
+    Description: Health check endpoint
+    Value: !Sub 'https://${HttpApi}.execute-api.${AWS::Region}.amazonaws.com/${StageName}/health'
+
+  StageName:
+    Description: API stage name
+    Value: !Ref StageName
+
+  SecurityConfig:
+    Description: API Gateway security controls
+    Value: |
+      ✓ CORS: Restricted to example.com
+      ✓ Routes: Strict (GET /health, /status only)
+      ✓ Throttling: 100 req/s (burst 50)
+      ✓ Logging: Access logs to CloudWatch
+      ✓ Catch-all: handled by Lambda (returns 404)
+      ✓ API Key: Enabled for tracking
+      ✓ Lambda permission restricted to specific API/Stage

@@ -1,0 +1,329 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: CloudFront distribution fronting HTTP API (HTTPS enforced, no cache, SNI, alarms, Config rule)
+
+Parameters:
+  ApiGatewayStackName:
+    Type: String
+    
+    Default: apigw-stack
+    Description: Name of the API Gateway stack to import ApiId and Stage
+
+  StageName:
+    Type: String
+    Default: v1
+    Description: API Gateway stage name for origin path
+
+  DomainName:
+    Type: String
+    Default: ''
+    Description: Custom domain (optional). If set, ACM cert must match.
+
+  AcmCertificateArn:
+    Type: String
+    Default: ''
+    Description: ACM certificate ARN in us-east-1 (for CloudFront). Required when DomainName is set.
+
+  CustomHeaderName:
+    Type: String
+    Default: ''
+    Description: Optional origin custom header name
+
+  CustomHeaderValue:
+    Type: String
+    Default: ''
+    Description: Optional origin custom header value
+
+  EnableCustomHeader:
+    Type: String
+    Default: 'false'
+    AllowedValues: ['true','false']
+
+  EnableStandardLogging:
+    Type: String
+    Default: 'true'
+    AllowedValues: ['true','false']
+    Description: Enable CloudFront standard logs to S3
+
+  LoggingBucketExportName:
+    Type: String
+    Default: s3-stack-CloudFrontLogsBucket
+    Description: Export name for CloudFront logs bucket (import from s3-stack)
+
+  EnableOriginShield:
+    Type: String
+    Default: 'false'
+    AllowedValues: ['true','false']
+    Description: Enable CloudFront Origin Shield for additional caching layer (additional cost)
+
+  OriginShieldRegion:
+    Type: String
+    Default: 'us-east-1'
+    Description: AWS region for Origin Shield (e.g., us-east-1, us-west-2). Required if EnableOriginShield is true
+
+  LoggingPrefix:
+    Type: String
+    Default: 'cf-logs/'
+    Description: Prefix for CloudFront logs
+
+  EnableGeoBlock:
+    Type: String
+    Default: 'false'
+    AllowedValues: ['true','false']
+    Description: Enable country blacklist via CloudFront restrictions
+
+  BlockedCountries:
+    Type: CommaDelimitedList
+    Default: ''
+    Description: Comma-delimited ISO country codes to block (e.g., CN,RU)
+
+  WafRateLimit:
+    Type: Number
+    Default: 2000
+    Description: WAFv2 IP rate limit per 5 minutes
+
+  EnableWaf:
+    Type: String
+    Default: 'false'
+    AllowedValues: ['true','false']
+    Description: Enable WAFv2 WebACL and association (requires us-east-1 region)
+
+Conditions:
+  CustomDomainEnabled: !Not [!Equals [!Ref DomainName, '']]
+  CustomHeaderEnabled: !Equals [!Ref EnableCustomHeader, 'true']
+  StandardLoggingEnabled: !And [!Equals [!Ref EnableStandardLogging, 'true'], !Not [!Equals [!Ref LoggingBucketExportName, '']]]
+  GeoBlockEnabled: !Equals [!Ref EnableGeoBlock, 'true']
+  WafEnabled: !Equals [!Ref EnableWaf, 'true']
+  GeoBlockViaWaf: !And [!Equals [!Ref EnableGeoBlock, 'true'], !Equals [!Ref EnableWaf, 'true']]
+  GeoBlockViaCf: !And [!Equals [!Ref EnableGeoBlock, 'true'], !Not [!Equals [!Ref EnableWaf, 'true']]]
+  OriginShieldEnabled: !Equals [!Ref EnableOriginShield, 'true']
+
+Resources:
+  Distribution:
+    Type: AWS::CloudFront::Distribution
+    Properties:
+      DistributionConfig:
+        Comment:
+          Fn::Sub:
+            - 'CloudFront for ${ApiId} (HTTPS only)'
+            - { ApiId: { "Fn::ImportValue": { "Fn::Sub": "${ApiGatewayStackName}-ApiId" } } }
+        Enabled: true
+        # Viewer certificate & HTTPS enforcement
+        ViewerCertificate: !If
+          - CustomDomainEnabled
+          - {
+              AcmCertificateArn: !Ref AcmCertificateArn,
+              SslSupportMethod: sni-only,
+              MinimumProtocolVersion: TLSv1.2_2021
+            }
+          - {
+              CloudFrontDefaultCertificate: true,
+              MinimumProtocolVersion: TLSv1.2_2021
+            }
+        Aliases: !If [CustomDomainEnabled, [!Ref DomainName], !Ref 'AWS::NoValue']
+        DefaultCacheBehavior:
+          TargetOriginId: api-origin
+          ViewerProtocolPolicy: redirect-to-https
+          CachePolicyId: '4135ea2d-6df8-44a3-9df3-4b5a84be39ad'
+          ResponseHeadersPolicyId: !Ref SecurityResponseHeaders
+        Origins:
+          - Id: api-origin
+            DomainName:
+              Fn::Sub:
+                - '${ApiId}.execute-api.${AWS::Region}.amazonaws.com'
+                - { ApiId: { "Fn::ImportValue": { "Fn::Sub": "${ApiGatewayStackName}-ApiId" } } }
+            OriginPath: !Sub '/${StageName}'
+            CustomOriginConfig:
+              OriginProtocolPolicy: https-only
+              HTTPSPort: 443
+              OriginSSLProtocols:
+                - TLSv1.2
+              OriginReadTimeout: 30
+              OriginKeepaliveTimeout: 5
+            OriginShield: !If
+              - OriginShieldEnabled
+              - {
+                  Enabled: true,
+                  OriginShieldRegion: !Ref OriginShieldRegion
+                }
+              - {
+                  Enabled: false
+                }
+            OriginCustomHeaders: !If
+              - CustomHeaderEnabled
+              - - HeaderName: !Ref CustomHeaderName
+                  HeaderValue: !Ref CustomHeaderValue
+              - !Ref 'AWS::NoValue'
+        IPV6Enabled: true
+        PriceClass: PriceClass_100
+        # Optional logging can be added later
+        Restrictions:
+          GeoRestriction:
+            RestrictionType: !If [GeoBlockViaCf, blacklist, none]
+            Locations: !If [GeoBlockViaCf, !Ref BlockedCountries, !Ref 'AWS::NoValue']
+        Logging: !If
+          - StandardLoggingEnabled
+          - Bucket: !Sub
+              - '${LoggingBucket}.s3.amazonaws.com'
+              - LoggingBucket:
+                  Fn::ImportValue: !Ref LoggingBucketExportName
+            Prefix: 'cloudfront-logs/'
+            IncludeCookies: false
+          - !Ref 'AWS::NoValue'
+        # Root routing (no path on viewer side)
+        DefaultRootObject: ''
+
+  SecurityResponseHeaders:
+    Type: AWS::CloudFront::ResponseHeadersPolicy
+    Properties:
+      ResponseHeadersPolicyConfig:
+        Name: security-headers-policy
+        Comment: Add HSTS, X-Content-Type-Options, X-Frame-Options
+        SecurityHeadersConfig:
+          StrictTransportSecurity:
+            AccessControlMaxAgeSec: 31536000
+            IncludeSubdomains: true
+            Preload: true
+            Override: true
+          ContentTypeOptions:
+            Override: true
+          FrameOptions:
+            FrameOption: DENY
+            Override: true
+
+  # Alarms for CloudFront errors (Global metrics)
+  CloudFront4xxAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${AWS::StackName}-CloudFront-4xx'
+      AlarmDescription: 4xx error rate exceeds threshold
+      Namespace: AWS/CloudFront
+      MetricName: 4xxErrorRate
+      Dimensions:
+        - Name: DistributionId
+          Value: !Ref Distribution
+        - Name: Region
+          Value: Global
+      Statistic: Average
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: []
+
+  CloudFront5xxAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${AWS::StackName}-CloudFront-5xx'
+      AlarmDescription: 5xx error rate exceeds threshold
+      Namespace: AWS/CloudFront
+      MetricName: 5xxErrorRate
+      Dimensions:
+        - Name: DistributionId
+          Value: !Ref Distribution
+        - Name: Region
+          Value: Global
+      Statistic: Average
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: []
+
+  # AWS Config rule - moved to config.yaml stack
+  # CloudFrontHttpsOnlyRule now managed by config-stack for centralized compliance monitoring
+
+  # WAFv2 WebACL for CloudFront (Global scope)
+  CloudFrontWebACL:
+    Type: AWS::WAFv2::WebACL
+    Condition: WafEnabled
+    Properties:
+      Name: !Sub 'cf-webacl-${AWS::StackName}'
+      Scope: CLOUDFRONT
+      DefaultAction:
+        Allow: {}
+      VisibilityConfig:
+        CloudWatchMetricsEnabled: true
+        MetricName: !Sub 'cf-webacl-${AWS::StackName}'
+        SampledRequestsEnabled: true
+      Rules:
+        - Name: aws-managed-common
+          Priority: 10
+          Statement:
+            ManagedRuleGroupStatement:
+              VendorName: AWS
+              Name: AWSManagedRulesCommonRuleSet
+          Action:
+            Block: {}
+          VisibilityConfig:
+            CloudWatchMetricsEnabled: true
+            MetricName: aws-managed-common
+            SampledRequestsEnabled: true
+        - Name: aws-managed-known-bad
+          Priority: 20
+          Statement:
+            ManagedRuleGroupStatement:
+              VendorName: AWS
+              Name: AWSManagedRulesKnownBadInputsRuleSet
+          Action:
+            Block: {}
+          VisibilityConfig:
+            CloudWatchMetricsEnabled: true
+            MetricName: aws-managed-known-bad
+            SampledRequestsEnabled: true
+        - Name: rate-limit
+          Priority: 30
+          Statement:
+            RateBasedStatement:
+              Limit: !Ref WafRateLimit
+              AggregateKeyType: IP
+          Action:
+            Block: {}
+          VisibilityConfig:
+            CloudWatchMetricsEnabled: true
+            MetricName: rate-limit
+            SampledRequestsEnabled: true
+
+  CloudFrontWebACLAssociation:
+    Type: AWS::WAFv2::WebACLAssociation
+    Condition: WafEnabled
+    Properties:
+      ResourceArn: !Sub 'arn:aws:cloudfront::${AWS::AccountId}:distribution/${Distribution}'
+      WebACLArn: !GetAtt CloudFrontWebACL.Arn
+    DependsOn:
+      - Distribution
+
+Outputs:
+  DistributionId:
+    Description: CloudFront Distribution ID
+    Value: !Ref Distribution
+    Export:
+      Name: !Sub ${AWS::StackName}-DistributionId
+
+  DistributionDomainName:
+    Description: CloudFront domain name
+    Value: !GetAtt Distribution.DomainName
+    Export:
+      Name: !Sub ${AWS::StackName}-DistributionDomain
+
+  OriginDomainName:
+    Description: API Gateway origin domain
+    Value:
+      Fn::Sub:
+        - '${ApiId}.execute-api.${AWS::Region}.amazonaws.com'
+        - { ApiId: { "Fn::ImportValue": { "Fn::Sub": "${ApiGatewayStackName}-ApiId" } } }
+
+  WebACLArn:
+    Description: WAFv2 WebACL ARN associated to CloudFront
+    Condition: WafEnabled
+    Value: !GetAtt CloudFrontWebACL.Arn
+
+  ApiId:
+    Description: Imported API ID
+    Value:
+      Fn::ImportValue: !Sub ${ApiGatewayStackName}-ApiId
+
+  StageName:
+    Description: Stage name used as origin path
+    Value: !Ref StageName

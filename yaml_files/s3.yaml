@@ -1,0 +1,281 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: S3 bucket for CloudTrail logs with enhanced security hardening
+
+Resources:
+  CloudTrailBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub 'cloudtrail-logs-${AWS::AccountId}-${AWS::Region}'
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      VersioningConfiguration:
+        Status: Enabled
+      LoggingConfiguration:
+        DestinationBucketName: !Ref CloudTrailBucketAccessLogs
+        LogFilePrefix: cloudtrail-access/
+      # Prevent accidental deletion
+      LifecycleConfiguration:
+        Rules:
+          - Id: TransitionToGlacier
+            Status: Enabled
+            Transitions:
+              - StorageClass: GLACIER
+                TransitionInDays: 90
+            NoncurrentVersionTransitions:
+              - StorageClass: GLACIER
+                TransitionInDays: 30
+      Tags:
+        - Key: Purpose
+          Value: CloudTrail-Audit-Logs
+        - Key: Security
+          Value: Strict
+
+  # Bucket logging (who accessed the audit bucket?)
+  CloudTrailBucketAccessLogs:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub 'cloudtrail-access-logs-${AWS::AccountId}-${AWS::Region}'
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      VersioningConfiguration:
+        Status: Enabled
+
+  CloudTrailBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref CloudTrailBucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          # CloudTrail ACL check
+          - Sid: AWSCloudTrailAclCheck
+            Effect: Allow
+            Principal:
+              Service: cloudtrail.amazonaws.com
+            Action: 's3:GetBucketAcl'
+            Resource: !GetAtt CloudTrailBucket.Arn
+
+          # CloudTrail write access
+          - Sid: AWSCloudTrailWrite
+            Effect: Allow
+            Principal:
+              Service: cloudtrail.amazonaws.com
+            Action: 's3:PutObject'
+            Resource: !Sub '${CloudTrailBucket.Arn}/AWSLogs/${AWS::AccountId}/*'
+            Condition:
+              StringEquals:
+                's3:x-amz-acl': bucket-owner-full-control
+
+          # Deny unencrypted uploads
+          - Sid: DenyUnencryptedUploads
+            Effect: Deny
+            Principal: '*'
+            Action: 's3:PutObject'
+            Resource: !Sub '${CloudTrailBucket.Arn}/*'
+            Condition:
+              StringNotEquals:
+                's3:x-amz-server-side-encryption': AES256
+
+          # Deny deletion of audit logs (permanent record)
+          - Sid: DenyLogDeletion
+            Effect: Deny
+            Principal: '*'
+            Action:
+              - 's3:DeleteObject'
+              - 's3:DeleteObjectVersion'
+            Resource: !Sub '${CloudTrailBucket.Arn}/AWSLogs/*'
+            Condition:
+              StringNotLike:
+                'aws:userid': '*:cloudformation-*'
+
+          # Deny policy changes (immutable audit trail)
+          - Sid: DenyBucketPolicyModification
+            Effect: Deny
+            Principal: '*'
+            Action: 's3:PutBucketPolicy'
+            Resource: !GetAtt CloudTrailBucket.Arn
+            Condition:
+              StringNotEquals:
+                'aws:CalledVia': 'cloudformation.amazonaws.com'
+
+  # CloudFront Logs Bucket
+  CloudFrontLogsBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub 'cloudfront-logs-${AWS::AccountId}-${AWS::Region}'
+      OwnershipControls:
+        Rules:
+          - ObjectOwnership: BucketOwnerPreferred
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: false
+        BlockPublicPolicy: true
+        IgnorePublicAcls: false
+        RestrictPublicBuckets: true
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      VersioningConfiguration:
+        Status: Enabled
+      # Retain logs for compliance (90 days min)
+      LifecycleConfiguration:
+        Rules:
+          - Id: TransitionOldLogs
+            Status: Enabled
+            Transitions:
+              - StorageClass: STANDARD_IA
+                TransitionInDays: 30
+              - StorageClass: GLACIER
+                TransitionInDays: 90
+      Tags:
+        - Key: Purpose
+          Value: CloudFront-Logs
+        - Key: Security
+          Value: Strict
+
+  # Lambda code artifact bucket (deployment packages)
+  LambdaCodeBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub 'lambda-code-${AWS::AccountId}-${AWS::Region}'
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      VersioningConfiguration:
+        Status: Enabled
+      Tags:
+        - Key: Purpose
+          Value: Lambda-Code
+        - Key: Security
+          Value: Strict
+
+  # Security Hub evidence/findings export bucket (optional future use)
+  SecurityHubBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub 'securityhub-artifacts-${AWS::AccountId}-${AWS::Region}'
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      VersioningConfiguration:
+        Status: Enabled
+      LifecycleConfiguration:
+        Rules:
+          - Id: TransitionOldFindings
+            Status: Enabled
+            Transitions:
+              - StorageClass: STANDARD_IA
+                TransitionInDays: 30
+              - StorageClass: GLACIER
+                TransitionInDays: 180
+      Tags:
+        - Key: Purpose
+          Value: SecurityHub-Artifacts
+        - Key: Security
+          Value: Strict
+
+  # Allow CloudFront canonical user to write logs
+  CloudFrontLogsBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref CloudFrontLogsBucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          # Allow CloudFront to put logs (canonical user ID)
+          - Sid: AllowCloudFrontLogs
+            Effect: Allow
+            Principal:
+              CanonicalUser: c4c1ede66af53448b93c283ce9448c4ba468c9432aa01d700d3878632f77d2d0
+            Action:
+              - 's3:PutObject'
+            Resource: !Sub '${CloudFrontLogsBucket.Arn}/*'
+            Condition:
+              StringEquals:
+                's3:x-amz-acl': bucket-owner-full-control
+          - Sid: AllowCloudFrontBucketAcl
+            Effect: Allow
+            Principal:
+              CanonicalUser: c4c1ede66af53448b93c283ce9448c4ba468c9432aa01d700d3878632f77d2d0
+            Action: 's3:GetBucketAcl'
+            Resource: !GetAtt CloudFrontLogsBucket.Arn
+
+Outputs:
+  CloudTrailBucketName:
+    Description: Name of the S3 bucket for CloudTrail logs
+    Value: !Ref CloudTrailBucket
+    Export:
+      Name: !Sub ${AWS::StackName}-CloudTrailBucket
+
+  CloudTrailBucketArn:
+    Description: ARN of the S3 bucket for CloudTrail logs
+    Value: !GetAtt CloudTrailBucket.Arn
+    Export:
+      Name: !Sub ${AWS::StackName}-CloudTrailBucketArn
+
+  CloudTrailAccessLogsBucket:
+    Description: Name of the S3 bucket for CloudTrail access logs
+    Value: !Ref CloudTrailBucketAccessLogs
+    Export:
+      Name: !Sub ${AWS::StackName}-AccessLogsBucket
+  CloudFrontLogsBucketName:
+    Description: Name of the S3 bucket for CloudFront logs
+    Value: !Ref CloudFrontLogsBucket
+    Export:
+      Name: !Sub ${AWS::StackName}-CloudFrontLogsBucket
+
+  CloudFrontLogsBucketArn:
+    Description: ARN of the S3 bucket for CloudFront logs
+    Value: !GetAtt CloudFrontLogsBucket.Arn
+    Export:
+      Name: !Sub ${AWS::StackName}-CloudFrontLogsBucketArn
+
+  LambdaCodeBucketName:
+    Description: Name of the S3 bucket for Lambda code artifacts
+    Value: !Ref LambdaCodeBucket
+    Export:
+      Name: !Sub ${AWS::StackName}-LambdaCodeBucket
+
+  LambdaCodeBucketArn:
+    Description: ARN of the S3 bucket for Lambda code artifacts
+    Value: !GetAtt LambdaCodeBucket.Arn
+    Export:
+      Name: !Sub ${AWS::StackName}-LambdaCodeBucketArn
+
+  SecurityHubBucketName:
+    Description: Name of the S3 bucket for Security Hub artifacts
+    Value: !Ref SecurityHubBucket
+    Export:
+      Name: !Sub ${AWS::StackName}-SecurityHubBucket
+
+  SecurityHubBucketArn:
+    Description: ARN of the S3 bucket for Security Hub artifacts
+    Value: !GetAtt SecurityHubBucket.Arn
+    Export:
+      Name: !Sub ${AWS::StackName}-SecurityHubBucketArn

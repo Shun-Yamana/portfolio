@@ -1,0 +1,6 @@
+app.zip
+__pycache__/
+*.pyc
+.venv/
+.env
+*.log

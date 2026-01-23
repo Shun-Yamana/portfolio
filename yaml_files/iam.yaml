@@ -1,0 +1,176 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: IAM roles and policies for Lambda functions with hardened security controls
+
+Parameters:
+  FunctionName:
+    Type: String
+    Default: secure-lambda
+    Description: Logical name for the Lambda function (for log group ARN)
+
+Resources:
+  # Permission Boundary - prevents privilege escalation even if policies are misconfigured
+  LambdaPermissionsBoundaryPolicy:
+    Type: AWS::IAM::ManagedPolicy
+    Properties:
+      ManagedPolicyName: !Sub ${FunctionName}-permissions-boundary
+      Description: Permissions boundary - maximum allowed permissions for Lambda execution role
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          # CloudWatch Logs - write only to function-specific log group
+          - Sid: CloudWatchLogsWrite
+            Effect: Allow
+            Action:
+              - 'logs:CreateLogStream'
+              - 'logs:PutLogEvents'
+            Resource: !Sub 'arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/${FunctionName}:*'
+          
+          # X-Ray write access (for tracing)
+          - Sid: XRayWriteAccess
+            Effect: Allow
+            Action:
+              - 'xray:PutTraceSegments'
+              - 'xray:PutTelemetryRecords'
+            Resource: '*'
+          
+          # Explicit deny on dangerous actions (defense in depth)
+          - Sid: DenyDangerousActions
+            Effect: Deny
+            Action:
+              - 'iam:*'
+              - 'sts:AssumeRole'
+              - 'kms:ScheduleKeyDeletion'
+              - 'kms:DisableKey'
+              - 'logs:DeleteLogGroup'
+              - 'cloudtrail:StopLogging'
+              - 's3:DeleteBucket'
+            Resource: '*'
+
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub ${FunctionName}-execution-role
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: 'sts:AssumeRole'
+            Condition:
+              StringEquals:
+                # Only assume when called via CloudFormation or Lambda invoke
+                'aws:SourceAccount': !Ref 'AWS::AccountId'
+      
+      # Attach permission boundary - this CANNOT be exceeded
+      PermissionsBoundary: !GetAtt LambdaPermissionsBoundaryPolicy.PolicyArn
+      
+      Policies:
+        # Inline policy - CloudWatch Logs access (restricted)
+        - PolicyName: CloudWatchLogsStrict
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - 'logs:CreateLogStream'
+                  - 'logs:PutLogEvents'
+                Resource: !Sub 'arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/${FunctionName}:*'
+        
+        # Inline policy - X-Ray tracing
+        - PolicyName: XRayWriteAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - 'xray:PutTraceSegments'
+                  - 'xray:PutTelemetryRecords'
+                Resource: '*'
+      
+      Tags:
+        - Key: security
+          Value: strict
+        - Key: boundary
+          Value: enforced
+
+  # Deny policy - prevent direct Lambda role modification outside CloudFormation
+  LambdaRoleProtectionPolicy:
+    Type: AWS::IAM::Policy
+    Properties:
+      PolicyName: !Sub ${FunctionName}-role-protection-deny
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          # Only CloudFormation can modify this role
+          - Sid: DenyDirectModification
+            Effect: Deny
+            Action:
+              - 'iam:PutRolePolicy'
+              - 'iam:AttachRolePolicy'
+              - 'iam:DetachRolePolicy'
+              - 'iam:DeleteRolePolicy'
+              - 'iam:UpdateRole'
+            Resource: !GetAtt LambdaExecutionRole.Arn
+            Condition:
+              StringNotEquals:
+                'aws:CalledVia': 'cloudformation.amazonaws.com'
+      Roles:
+        - !Ref LambdaExecutionRole
+
+  # API Gateway role - invoke Lambda only
+  ApiGatewayLambdaInvokeRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub ${FunctionName}-apigw-lambda-invoke-role
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: apigateway.amazonaws.com
+            Action: 'sts:AssumeRole'
+            Condition:
+              StringEquals:
+                'aws:SourceAccount': !Ref 'AWS::AccountId'
+      Policies:
+        - PolicyName: InvokeLambdaOnly
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              # Invoke Lambda function - allow any Lambda in the account
+              - Sid: InvokeLambda
+                Effect: Allow
+                Action:
+                  - 'lambda:InvokeFunction'
+                Resource: '*'
+      Tags:
+        - Key: security
+          Value: strict
+        - Key: purpose
+          Value: apigw-lambda-integration
+
+Outputs:
+  LambdaExecutionRoleArn:
+    Description: ARN of the Lambda execution role
+    Value: !GetAtt LambdaExecutionRole.Arn
+    Export:
+      Name: !Sub ${AWS::StackName}-LambdaExecutionRoleArn
+
+  LambdaPermissionsBoundaryArn:
+    Description: ARN of the permissions boundary policy
+    Value: !GetAtt LambdaPermissionsBoundaryPolicy.PolicyArn
+    Export:
+      Name: !Sub ${AWS::StackName}-PermissionsBoundaryArn
+
+  LambdaExecutionRoleName:
+    Description: Name of the Lambda execution role
+    Value: !Ref LambdaExecutionRole
+    Export:
+      Name: !Sub ${AWS::StackName}-LambdaExecutionRoleName
+
+  ApiGatewayLambdaInvokeRoleArn:
+    Description: ARN of the API Gateway Lambda invoke role
+    Value: !GetAtt ApiGatewayLambdaInvokeRole.Arn
+    Export:
+      Name: !Sub ${AWS::StackName}-ApiGatewayLambdaInvokeRoleArn

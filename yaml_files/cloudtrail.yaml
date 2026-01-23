@@ -1,0 +1,69 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: CloudTrail audit logging for Lambda function (management + insights)
+
+Parameters:
+  FunctionName:
+    Type: String
+    Default: secure-lambda
+    Description: Function name (used for CloudTrail naming)
+
+  S3StackName:
+    Type: String
+    Default: s3-stack
+    Description: Name of the S3 stack containing the CloudTrail bucket
+
+Resources:
+  CloudTrailTrail:
+    Type: AWS::CloudTrail::Trail
+    Properties:
+      TrailName: !Sub ${FunctionName}-trail
+      S3BucketName:
+        Fn::ImportValue: !Sub ${S3StackName}-CloudTrailBucket
+      IsLogging: true
+      IsMultiRegionTrail: true
+      IncludeGlobalServiceEvents: true
+      EnableLogFileValidation: true
+      # Management Events - all API calls (Create/Update/Delete)
+      EventSelectors:
+        - ReadWriteType: All
+          IncludeManagementEvents: true
+      # Insights - automatic anomaly detection (unusual API call rate)
+      InsightSelectors:
+        - InsightType: ApiCallRateInsight
+      Tags:
+        - Key: security
+          Value: audit
+        - Key: function
+          Value: !Ref FunctionName
+
+Outputs:
+  CloudTrailName:
+    Description: Created CloudTrail trail name
+    Value: !Ref CloudTrailTrail
+    Export:
+      Name: !Sub ${AWS::StackName}-CloudTrailName
+
+  CloudTrailArn:
+    Description: CloudTrail ARN
+    Value: !GetAtt CloudTrailTrail.Arn
+    Export:
+      Name: !Sub ${AWS::StackName}-CloudTrailArn
+
+  S3Bucket:
+    Description: S3 bucket storing CloudTrail logs
+    Value:
+      Fn::ImportValue: !Sub ${S3StackName}-CloudTrailBucket
+    Export:
+      Name: !Sub ${AWS::StackName}-S3Bucket
+
+  AuditConfig:
+    Description: CloudTrail audit configuration
+    Value: |
+      ✓ Management events: All (Create/Update/Delete)
+      ✓ Log file validation: Enabled (tamper detection)
+      ✓ Multi-region trail: Yes
+      ✓ Global service events: Yes
+      ✓ Insights: API call rate anomaly detection
+      ✓ S3 destination: Hardened (via s3-stack)
+    Export:
+      Name: !Sub ${AWS::StackName}-AuditConfig
