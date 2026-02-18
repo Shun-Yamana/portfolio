@@ -156,8 +156,6 @@ AWS Security Hub / GuardDuty 連携を想定
 
 インシデント対応・運用フェーズを見据えた設計
 
-将来拡張
-
 RDS / DynamoDB 連携
 
 Lambda の VPC 接続を含む最小権限設計検証
